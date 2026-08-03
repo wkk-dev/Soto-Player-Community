@@ -43,9 +43,9 @@ jobs:
   build:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    # 精确 token 匹配（模拟 split），避免 contains 子串误匹配：
-    # replace 逗号 -> '","' 后用 fromJSON 转数组，再 contains 判目标架构
-    if: contains(fromJSON(format('["{0}"]', replace(github.event.inputs.architectures || 'linux-x64,linux-arm64', ',', '","'))), matrix.target)
+    # 精确 token 匹配：给架构串两端加逗号后判 ',目标,' 是否在其中，
+    # 避免 contains 子串误匹配（如 linux-x64 误配 linux-x64-foo）
+    if: contains(format(',{0},', github.event.inputs.architectures || 'linux-x64,linux-arm64'), format(',{0},', matrix.target))
     strategy:
       fail-fast: false
       matrix:
