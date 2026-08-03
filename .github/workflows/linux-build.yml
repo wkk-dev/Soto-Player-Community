@@ -1,0 +1,178 @@
+# Linux 独立构建/发布工作流（x64 + arm64）
+# 手动触发，可选择架构与是否创建 GitHub Release。
+# 与 release.yml（tag 全平台发布）互补，不参与 tag 自动发布。
+name: Linux Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      architectures:
+        description: 要构建的架构（多架构用逗号分隔）
+        type: choice
+        options:
+          - linux-x64
+          - linux-arm64
+          - linux-x64,linux-arm64
+        default: linux-x64,linux-arm64
+      create_release:
+        description: 构建完成后创建 GitHub Release
+        type: boolean
+        default: false
+      draft:
+        description: Release 是否以草稿形式创建
+        type: boolean
+        default: true
+      release_tag:
+        description: Release 标签（如 v2.3.8；留空则用 package.json 版本自动生成）
+        type: string
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  NODE_VERSION: 22.x
+
+# 同一触发的发布串行执行，避免并发上传资源产生竞态
+concurrency:
+  group: linux-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # 各架构在对应的原生 runner 上独立构建（arm64 用 ARM runner，避免交叉编译）
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    if: contains(github.event.inputs.architectures || 'linux-x64,linux-arm64', matrix.target)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            target: linux-x64
+            arch: x64
+            runner: ubuntu-latest
+          - name: Linux arm64
+            target: linux-arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out git repository
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "native/audio-engine -> target\nnative/media-ctrl -> target"
+
+      # Linux: 安装系统构建/打包依赖
+      - name: 安装系统依赖 (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libasound2-dev libdbus-1-dev pkg-config clang \
+            rpm libarchive-tools
+
+      # 清理旧构建产物
+      - name: Clean workspace
+        run: rm -rf dist out
+
+      # CI 不需要国内镜像
+      - name: 移除 .npmrc
+        shell: bash
+        run: rm -f .npmrc
+
+      # 安装项目依赖
+      - name: Install dependencies
+        run: pnpm install
+
+      # 仅构建本机架构
+      - name: Build ${{ matrix.name }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: pnpm build:linux --${{ matrix.arch }} --publish never
+
+      # 修复 Linux arm64 自动更新清单命名
+      # electron-builder 单独构建 arm64 时仍命名为 latest-linux.yml，会与 x64 撞名，
+      # 显式重命名为 latest-linux-arm64.yml（electron-updater 在 arm64 上据此查找）
+      - name: Rename Linux arm64 update manifest
+        if: matrix.target == 'linux-arm64'
+        shell: bash
+        run: |
+          if [ -f dist/latest-linux.yml ]; then
+            mv dist/latest-linux.yml dist/latest-linux-arm64.yml
+            echo "Renamed latest-linux.yml -> latest-linux-arm64.yml"
+          else
+            echo "dist/latest-linux.yml not found, skipping"
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Soto-Player-Community-${{ matrix.name }}
+          path: dist/*.*
+
+  # 合并构建产物并创建 GitHub Release（仅在选择 create_release 时执行）
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event.inputs.create_release == 'true'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      # 整理待发布资源（Linux 各架构清单天然不冲突，脚本负责去重与剔除调试文件）
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          npm install --no-save --prefix "$RUNNER_TEMP/jsyaml" js-yaml@4.1.0
+          NODE_PATH="$RUNNER_TEMP/jsyaml/node_modules" \
+            node .github/scripts/prepare-release-assets.cjs artifacts release-assets
+          echo "待发布资源："
+          ls -1 release-assets
+
+      # 用官方 gh CLI 创建 Release（草稿；重跑场景先删同名 Release 避免脏状态）
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          TAG="${{ inputs.release_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="v$(node -p "require('./package.json').version")"
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --generate-notes \
+            --draft="${{ inputs.draft }}" \
+            release-assets/*
