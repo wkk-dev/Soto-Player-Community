@@ -43,9 +43,6 @@ jobs:
   build:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    # 精确 token 匹配：给架构串两端加逗号后判 ',目标,' 是否在其中，
-    # 避免 contains 子串误匹配（如 linux-x64 误配 linux-x64-foo）
-    if: contains(format(',{0},', github.event.inputs.architectures || 'linux-x64,linux-arm64'), format(',{0},', matrix.target))
     strategy:
       fail-fast: false
       matrix:
@@ -59,27 +56,47 @@ jobs:
             arch: arm64
             runner: ubuntu-24.04-arm
     steps:
+      # matrix 上下文只在 step 级可用，故在首个 step 判定架构是否被选中。
+      # 给架构串两端加逗号后做精确 token 匹配，避免子串误匹配（如 linux-x64 误配 linux-x64-foo）
+      - name: Check architecture selection
+        id: arch-check
+        shell: bash
+        env:
+          ARCHITECTURES: ${{ github.event.inputs.architectures || 'linux-x64,linux-arm64' }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          case ",${ARCHITECTURES}," in
+            *",${TARGET},"*) echo "skip=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "skip=true" >> "$GITHUB_OUTPUT"; echo "未选择架构 ${TARGET}，跳过构建" ;;
+          esac
+
       - name: Check out git repository
+        if: steps.arch-check.outputs.skip != 'true'
         uses: actions/checkout@v5
 
       - name: Setup pnpm
+        if: steps.arch-check.outputs.skip != 'true'
         uses: pnpm/action-setup@v6
 
       - name: Setup Node.js
+        if: steps.arch-check.outputs.skip != 'true'
         uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
 
       - name: Setup Rust toolchain
+        if: steps.arch-check.outputs.skip != 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Rust Cache
+        if: steps.arch-check.outputs.skip != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "native/audio-engine -> target\nnative/media-ctrl -> target"
 
       # Linux: 安装系统构建/打包依赖
       - name: 安装系统依赖 (Linux)
+        if: steps.arch-check.outputs.skip != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
@@ -88,19 +105,23 @@ jobs:
 
       # 清理旧构建产物
       - name: Clean workspace
+        if: steps.arch-check.outputs.skip != 'true'
         run: rm -rf dist out
 
       # CI 不需要国内镜像
       - name: 移除 .npmrc
+        if: steps.arch-check.outputs.skip != 'true'
         shell: bash
         run: rm -f .npmrc
 
       # 安装项目依赖
       - name: Install dependencies
+        if: steps.arch-check.outputs.skip != 'true'
         run: pnpm install
 
       # 仅构建本机架构
       - name: Build ${{ matrix.name }}
+        if: steps.arch-check.outputs.skip != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -111,7 +132,7 @@ jobs:
       # electron-builder 单独构建 arm64 时仍命名为 latest-linux.yml，会与 x64 撞名，
       # 显式重命名为 latest-linux-arm64.yml（electron-updater 在 arm64 上据此查找）
       - name: Rename Linux arm64 update manifest
-        if: matrix.target == 'linux-arm64'
+        if: steps.arch-check.outputs.skip != 'true' && matrix.target == 'linux-arm64'
         shell: bash
         run: |
           if [ -f dist/latest-linux.yml ]; then
@@ -122,6 +143,7 @@ jobs:
           fi
 
       - name: Upload Artifact
+        if: steps.arch-check.outputs.skip != 'true'
         uses: actions/upload-artifact@v7
         with:
           name: Soto-Player-Community-${{ matrix.name }}
