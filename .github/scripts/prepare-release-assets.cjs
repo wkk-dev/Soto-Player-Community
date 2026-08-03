@@ -33,7 +33,7 @@ if (!srcDir || !outDir) {
 const MERGE_MANIFESTS = new Set(["latest.yml", "latest-mac.yml"]);
 
 /** 不需要上传的文件 */
-const SKIP_FILES = new Set(["builder-debug.yml"]);
+const SKIP_FILES = new Set(["builder-debug.yml", "builder-effective-config.yaml"]);
 
 /**
  * 递归收集目录下的所有文件（跳过 *-unpacked 目录）
